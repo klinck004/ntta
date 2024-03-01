@@ -5,7 +5,7 @@ const router = express.Router();
 const GtfsRealtimeBindings = require('gtfs-realtime-bindings');
 const fetch = require('node-fetch');
 const feedUrl = 'https://drtonline.durhamregiontransit.com/gtfsrealtime/VehiclePositions';
-
+const tuURL = 'https://drtonline.durhamregiontransit.com/gtfsrealtime/TripUpdates';
 // Define getTrip to return static GTFS trip data
 // Useful for full return and individual return
 
@@ -29,11 +29,11 @@ async function getStop(stopId) {
 let StopTimes = require('../models/stop_times');
 async function getStopTime(tripId, stopId = undefined) {
     if (stopId === undefined) {
-        let value = await StopTimes.find({ trip_id: tripId});  
+        let value = await StopTimes.find({ trip_id: tripId });
         return value
     } else {
-        let value = await StopTimes.find({ trip_id: tripId, stop_id: stopId}); 
-        return value 
+        let value = await StopTimes.find({ trip_id: tripId, stop_id: stopId });
+        return value
     }
 }
 
@@ -51,20 +51,18 @@ async function getStopsOrder(tripId) {
     try {
         console.log("\ngetStopsOrder called")
         console.log("Recd tripId: " + tripId)
-        var stopList = [];
         let scheduleInfo = await getStopTime(tripId) // Get stop sequence and schedule information 
-    
+
         // Iterate through scheduleInfo
-    
-        await Promise.all(scheduleInfo.map(async (stop) => {
-            let stopId = stop.stop_id; // Get stop id from stop_times.txt
-            var stopInfo = await (getStop(stopId)); // Get stop INFORMATION from stops.txt
-            stopList.push({ stop_id: stopId, stopInfo: stopInfo, stopSched: stop}); // Add each stop to stopList: stopId, stop INFORMATION, and stop sequence/timing
-        })
-        ); 
+
+        let stopPromises = scheduleInfo.map(async (stop) => {
+            var stopInfo = await (getStop(stop.stop_id)); // Get stop INFORMATION from stops.txt
+            return ({ stop_id: stop.stop_id, stopInfo: stopInfo, stopSched: stop }); // Add each stop to stopList: stopId, stop INFORMATION, and stop sequence/timing
+        });
+
+        const stopList = await Promise.all(stopPromises);
         stopList.sort((a, b) => a.stopSched.stop_sequence - b.stopSched.stop_sequence); // Sort list by sequence order -- first stop to last stop
-        stopList = {stops: stopList} // Array in final result is now within stops object
-        return stopList
+        return { stops: stopList }
     } catch (error) {
         errorOut = ({ tripError: 'Error occurred in getStopsOrder', err: error });
         console.error(error)
@@ -91,17 +89,17 @@ async function getVehicleInfo(entityId) {
             }
         }
         if (Object.keys(returnVehicle).length === 0) {
-            return ({ vehicleError: ('No vehicles of id: ' + entityId)});
+            return ({ vehicleError: ('No vehicles of id: ' + entityId) });
         } else {
             return returnVehicle
         }
-        
+
     } catch (error) {
         errorOut = ({ vehicleError: 'Error occurred in getVehicleInfo', err: error });
         console.error(error)
         return errorOut
     }
-    
+
 }
 
 // Get full realtime route info
@@ -121,15 +119,15 @@ async function fullRoute(routeName) {
         var finalData = { entity: entityList }
         await Promise.all(data.entity.map(async (entity) => { // This should probably also be moved into a function
             if (entity.vehicle.trip.routeId == routeName) {
-                const tripId = entity.vehicle.trip.tripId;
-                const value = await getTrip(tripId);
+                const [value, stops] = await Promise.all([
+                    getTrip(entity.vehicle.trip.tripId),
+                    getStop(entity.vehicle.stopId)
+                ]);
+
                 entity.vehicle.timestamp = new Date(entity.vehicle.timestamp * 1000) // Convert timestamp to datetime obj
-                entity.vehicle.staticTrip = value[0];
-                const stopId = (entity.vehicle.stopId);
-                var stops = await getStop(stopId);
-                entity.vehicle.staticStop = stops;
-                let entityHold = (entity)
-                entityList.push(entityHold)
+                entity.vehicle.trip.tripInfo = value
+                entity.vehicle.stops = stops;
+                entityList.push(entity)
             }
         }));
 
@@ -161,33 +159,49 @@ async function gtfsRT() {
         console.error(error)
     }
 }
+async function gtfsTU() {
+    try {
+        console.log("gtfsTU called -- Feed trip update")
+        // Fetch realtime GTFS data
+        const response = await fetch(tuURL);
+        if (!response.ok) {
+            const error = new Error(`${response.url}: ${response.status} ${response.statusText}`);
+            error.response = response;
+            throw error;
+        }
+        const buffer = await response.arrayBuffer();
+        let feed = GtfsRealtimeBindings.transit_realtime.FeedMessage.decode(new Uint8Array(buffer));
+        feed = JSON.parse(JSON.stringify(feed)); // Copy feed to data
+        return feed
+    } catch (error) {
+        console.error(error)
+    }
+}
 
 // API ROUTES
 router.get('/beta/list', async (req, res) => {
     try {
-        console.log("\nTest - Show routes ");    
-        // Fetch GTFS data
-        const feed = await gtfsRT();
+        console.log("\nTest - Show routes ");
+        let feed = await gtfsRT();
+        let tripIds = feed.entity.map(entity => entity.vehicle.trip.tripId);
+        let tripInfo = await Trips.find({ trip_id: { $in: tripIds } });
 
-        // Push active routes to list
-        let routeList = [];
-        for (const entity of feed.entity) {
-            try {
-                routeList.push(entity.vehicle.trip.routeId)
-            } catch (error) {
-                console.error(error);
-            }
-        }     
-        // Drop duplicates
-        routeList = routeList.filter((value, index, self) => {
-            return self.indexOf(value) === index;
-        });
-        // Log info
-        console.log(routeList)   
-        
-        // Get route info from routes.txt
-        let routeInfo = await Routes.find({ route_id: routeList });
-        console.log("***** Routing complete")
+        function filterDuplicates(array) {
+            const seen = new Set();
+            return array.filter(obj => {
+                const key = `${obj.route_id}_${obj.trip_headsign}`; // Use template literals for key generation
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    return true;
+                }
+                return false;
+            });
+        }
+
+        const currentRoutes = filterDuplicates(tripInfo);
+        let routeIds = currentRoutes.map(entity => entity.route_id);
+        let routeInfo = await Routes.find({ route_id: { $in: routeIds } });
+        console.log(routeInfo)
         res.json(routeInfo)
     } catch (error) {
         console.error(error);
@@ -204,7 +218,7 @@ router.get('/beta/trip', async (req, res) => {
         let finalData = {}
         let tripInfo = await getTrip(tripId)
         let stops = await getStopsOrder(tripId); // Get static trip information
-        finalData = {tripInfo: tripInfo, stops: stops}
+        finalData = { tripInfo: tripInfo, stops: stops }
         console.log("***** Routing complete")
         res.json(finalData)
     } catch (error) {
@@ -218,7 +232,7 @@ router.get('/beta/routeInfo', async (req, res) => {
     try {
         console.log("Info called")
         routeId = req.query.route;
-        console.log("Recd routeId ", routeId)       
+        console.log("Recd routeId ", routeId)
         let routeInfo = await getRouteInfo(routeId)
         console.log("***** Routing complete")
         res.json(routeInfo)
@@ -233,59 +247,36 @@ router.get('/beta/showRoute', async (req, res) => {
     try {
         console.log("\Test - Show route info called ");
         const routeName = req.query.route;
-    
+
         // Fetch GTFS data
         const feed = await gtfsRT();
-    
-        // Filter entities based on routeName
-        let entityList = [];
-        for (const entity of feed.entity) {
-            try {
-                if (entity.vehicle.trip.routeId === routeName) {
-                    tripId = entity.vehicle.trip.tripId
-                    trip = await getTrip(tripId)
-                    entityList.push({trip: trip, entity_id: entity.id});
-                }
-            } catch (error) {
-                console.error(error);
-            }
-        }
+        const tripIds = feed.entity
+            .filter(entity => entity.vehicle.trip.routeId === routeName)
+            .map(entity => entity.vehicle.trip.tripId);
 
-        // Get each unique direction/branch on a route
-        const tripArray = entityList.map((entity) => {
-            return {
-                routeName: entity.trip.route_id,
-                headsign: entity.trip.trip_headsign,
-                trip: entity.trip.trip_id,
-                entityId: entity.entity_id
-            };
-        });
+        console.log(tripIds)
 
-        // Drop duplicate headsigns/branches
-        const tripInfo = tripArray.filter((obj, index, self) =>
-            index === self.findIndex((t) => t.headsign === obj.headsign)
-        );
+        const tripDetails = await Promise.all(tripIds.map(tripId => getTrip(tripId)));
+        console.log(tripDetails)
+        const uniqueHeadsigns = [...new Set(tripDetails.map(trip => trip.trip_headsign))];
+        console.log(uniqueHeadsigns)
 
-        let final = []
+        const final = await Promise.all(uniqueHeadsigns.map(async headsign => {
+            const trip = tripDetails.find(trip => trip.trip_headsign === headsign);
+            const stops = await getStopsOrder(trip.trip_id);
+            return { route: trip.route_id, headsign, stops };
+        }));
 
-        for (branch of tripInfo) {
-            tripId = branch.trip
-            entityId = branch.entityId
-            let stops = await getStopsOrder(tripId)
-            final.push({route: branch.routeName, headsign: branch.headsign, stops: stops})
-        }
         // Send response
         console.log("***** Routing complete")
         res.json(final);
-    
+
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error fetching route info' });
     }
-    
-})
 
-// Testing/indev routes
+})
 
 // Next stop test
 router.get('/test/next', async (req, res) => {
@@ -294,103 +285,42 @@ router.get('/test/next', async (req, res) => {
         const routeName = req.query.route
         const stopId = req.query.stop
         console.log("Recd route: " + routeName)
-        console.log("Recd stop: " + stopId)   
-        
+        console.log("Recd stop: " + stopId)
+
         // Take routeId and get full route vehicle return
         currentVehicles = await fullRoute(routeName)
-        console.log("\nReturned data")
+        console.log("\nCurrent vehicles on route")
         console.log(currentVehicles)
+        stopInfo = await getStop(stopId)
+        sendData = { stopInfo: stopInfo, currentVehicles }
+        let tuFeed = await gtfsTU();
+
         // Get schedule from getStopTimes / get GTFSRT tripupdate info when implemented
-        for (const x of currentVehicles.entity) {
-            try {
-                console.log(x.vehicle.trip.tripId)
-                currentStop = await getStopTime(x.vehicle.trip.tripId, stopId)
-                x.stopInfo = currentStop[0]
-                console.log(x.stopInfo)
-                if (x.stopInfo === undefined) {
-                    console.log("Stop info blank")
-                    let index = currentVehicles.entity.findIndex(item => item.id === x.id);
-                    if (index !== -1) {
-                        currentVehicles.entity.splice(index, 1);
-                        console.log("Removed")
-                    }
 
-
-                }
-            } catch (error) {
-                console.error(error);
+        currentVehicles.entity = currentVehicles.entity.map(entity => {
+            console.log(entity.vehicle.trip.tripId);
+            const test = tuFeed.entity.find(obj => obj.tripUpdate.trip.tripId === entity.vehicle.trip.tripId);
+            console.log(stopId);
+            let stop = null;
+            if (test) {
+                stop = test.tripUpdate.stopTimeUpdate.find(obj => obj.stopId === stopId);
+                console.log(stop);
             }
-        }    
-        console.log(currentVehicles)
-        res.json(currentVehicles)
-        // getStopTimes
-        //currentStops = await getStopTime()
+            entity.vehicle.trip.tripUpdate = stop
+            return entity;
+        });
 
-        // res.json("Lorem ipsum " + routeName + stopId)
 
-        // Steps
-        // Take routeId and get full route vehicle return
-        // Implement full route vehicle return: take from current /route and place into standalone function
-        // Get schedule from getStopTimes / get GTFSRT tripupdate info when implemented
-            // GTFSRT tripupdate example for this exact situation:
-                // Take tripId, iterate through stop_time_update until requested stop is found, return tripupdate info for stop
-        // Show next... whatever number of trips for the route
-        // If realtime is not available from tripupdate, return scheduled time and relay info accordingly on client side
 
+        console.log(sendData)
+        res.json(sendData)
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error fetching route info' });
     }
-    
+
 })
 
-// Old
-router.get('/call/routeVehicles', async (req, res) => {
-    try {
-        console.log("OLD Route request called")
-        let feed = await gtfsRT();
-        routeName = req.query.route;
-        console.log(routeName)
-        if (routeName === undefined) {
-            res.status(500).json({ error: 'A route ID is required' });
-        } else {
-            // Add static trip data to result
-            let data = JSON.parse(JSON.stringify(feed)); // Copy feed to data  
-            var entityList = [];
-            var finalData = { entity: entityList }
-            await Promise.all(data.entity.map(async (entity) => { // This should probably also be moved into a function
-                try {
-                    if (entity.vehicle.trip.routeId == routeName) {
-                        const tripId = entity.vehicle.trip.tripId;
-                        const value = await getTrip(tripId);
-                        entity.vehicle.timestamp = new Date(entity.vehicle.timestamp * 1000) // Convert timestamp to datetime obj
-                        entity.vehicle.staticTrip = value[0];
-                        const stopId = (entity.vehicle.stopId);
-                        var stops = await getStop(stopId);
-                        stops = stops[0];
-                        entity.vehicle.staticStop = stops;
-                        let entityHold = (entity)
-                        entityList.push(entityHold)
-                    }
-                } catch (error) {
-                    console.error(error);
-                }
-            }));
-            // Send JSON data
-            if (entityList.length === 0) {
-                console.log("No trips available")
-                res.json({ tripError: 'No trips available' });
-            } else {
-                res.json(finalData);
-                console.log(finalData)
-            }
-            console.log("***** Routing complete")
-        }
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Error fetching route info' });
-    }
-});
 
 
 router.get('/gtfs', async (req, res) => {
@@ -400,7 +330,7 @@ router.get('/gtfs', async (req, res) => {
 
         // Add static trip data to result
         let data = JSON.parse(JSON.stringify(feed)); // Copy feed to data
-        
+
         // Extract tripId from entity
         // Get static trip information using getTrip
         // Add static trip info to entity.vehicle.staticTrip
@@ -420,22 +350,41 @@ router.get('/gtfs', async (req, res) => {
                 console.error(error);
             }
         }));
-        
+
         // Send JSON data
         res.json(data);
 
     } catch (error) {
-      console.error('Error fetching GTFS-realtime data:', error);
-      res.status(500).json({ error: 'Error fetching GTFS-realtime data' });
+        console.error('Error fetching GTFS-realtime data:', error);
+        res.status(500).json({ error: 'Error fetching GTFS-realtime data' });
     }
-  });
-  
+});
+
 // Quick function test
 router.get('/test/function', async (req, res) => {
     try {
-        let input = req.query.input
-        let testFunc = await getVehicleInfo(input);
-        res.json(testFunc)
+        let feed = await gtfsRT();
+        let tripHold = [];
+        for (entity of feed.entity) {
+            let tripId = entity.vehicle.trip.tripId
+            tripHold.push(tripId);
+        }
+        let value = await Trips.find({ trip_id: tripHold });
+        function filterDuplicates(array) {
+            const seen = new Set();
+            return array.filter(obj => {
+                const key = obj.route_id + obj.trip_headsign;
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    return true;
+                }
+                return false;
+            });
+        }
+
+        const currentRoutes = filterDuplicates(value);
+        console.log(currentRoutes)
+        res.json(currentRoutes)
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error fetching route info' });
