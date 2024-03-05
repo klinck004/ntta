@@ -11,12 +11,16 @@ const tuURL = 'https://drtonline.durhamregiontransit.com/gtfsrealtime/TripUpdate
 
 // Get static trip info by tripId
 let Trips = require('../models/trips');
+let UniqueTrips = require('../models/unique_trips');
 async function getTrip(tripId) {
     let value = await Trips.find({ trip_id: tripId });
     value = value[0]
     return value;
 }
 
+let Calendar = require('../models/calendar');
+let CalendarDates = require('../models/calendar_dates');
+let StopList = require('../models/stop_list');
 // Get stop info by stopId
 let Stops = require('../models/stops');
 async function getStop(stopId) {
@@ -141,6 +145,14 @@ async function fullRoute(routeName) {
     }
 }
 
+
+// GTFS realtime data 
+// *** When making changes for other agencies later consider that some agencies split realtime, trip updates, and alerts into separate feeds
+// cough cough DRT
+// See: https://gtfs.org/realtime/feed-entities/trip-updates/
+// *** Potentially combine into one function with arguments that call/return the different types of data
+
+// Master realtime only call
 async function gtfsRT() {
     try {
         console.log("gtfsRT called -- Feed update")
@@ -159,6 +171,8 @@ async function gtfsRT() {
         console.error(error)
     }
 }
+
+// Master tripupdate only call
 async function gtfsTU() {
     try {
         console.log("gtfsTU called -- Feed trip update")
@@ -243,8 +257,11 @@ router.get('/beta/routeInfo', async (req, res) => {
     }
 })
 
+// Old showRoute function
 router.get('/beta/showRoute', async (req, res) => {
     try {
+        const start = Date.now();
+
         console.log("\Test - Show route info called ");
         const routeName = req.query.route;
 
@@ -270,7 +287,8 @@ router.get('/beta/showRoute', async (req, res) => {
         // Send response
         console.log("***** Routing complete")
         res.json(final);
-
+        const end = Date.now();
+        console.log(`Execution time: ${end - start} ms`);
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error fetching route info' });
@@ -281,6 +299,10 @@ router.get('/beta/showRoute', async (req, res) => {
 // Next stop test
 router.get('/test/next', async (req, res) => {
     try {
+        // Get shape id from unique trips?
+        // Or get shape id from active trips?
+        // Test for speed and efficiency
+
         console.log("\nStop test called");
         const routeName = req.query.route
         const stopId = req.query.stop
@@ -299,7 +321,7 @@ router.get('/test/next', async (req, res) => {
 
         currentVehicles.entity = currentVehicles.entity.map(entity => {
             console.log(entity.vehicle.trip.tripId);
-            const test = tuFeed.entity.find(obj => obj.tripUpdate.trip.tripId === entity.vehicle.trip.tripId);
+            const test = tuFeed.entity.find(obj => obj.tripUpdate.trip.tripId === entity.vehicle.trip.tripId); // Find from live tripupdate data
             console.log(stopId);
             let stop = null;
             if (test) {
@@ -335,7 +357,6 @@ router.get('/gtfs', async (req, res) => {
         // Get static trip information using getTrip
         // Add static trip info to entity.vehicle.staticTrip
         // Promise.all makes sure that all async functions are complete before continuing
-
         await Promise.all(data.entity.map(async (entity) => {
             try {
                 const tripId = entity.vehicle.trip.tripId;
@@ -363,31 +384,56 @@ router.get('/gtfs', async (req, res) => {
 // Quick function test
 router.get('/test/function', async (req, res) => {
     try {
-        let feed = await gtfsRT();
-        let tripHold = [];
-        for (entity of feed.entity) {
-            let tripId = entity.vehicle.trip.tripId
-            tripHold.push(tripId);
-        }
-        let value = await Trips.find({ trip_id: tripHold });
-        function filterDuplicates(array) {
-            const seen = new Set();
-            return array.filter(obj => {
-                const key = obj.route_id + obj.trip_headsign;
-                if (!seen.has(key)) {
-                    seen.add(key);
-                    return true;
-                }
-                return false;
-            });
-        }
+        const start = Date.now(); // Runtime testing
+        let routeId = req.query.route
 
-        const currentRoutes = filterDuplicates(value);
-        console.log(currentRoutes)
-        res.json(currentRoutes)
+        // Put this into a function 
+        // Should this be called every time it's needed? 
+        // Y: it's useful to find the service date if it changes while a user is using it
+        // N: service date may change (weekday to weekend) but trips from the previous day may still be running
+        // ^ Is this something that can be accounted for through specific vehicle/stop tracking? 
+        // Is it strictly necessary for showing the routes? Typically, how often do stops change over days? 
+        // Take all this into account
+
+        // Then use to find the trip headsign
+        /*
+        const d = new Date();
+        let day = d.getDay();
+        let date = (d.getDate() < 10 ? '0' : '') + d.getDate()
+        let month = d.getMonth() + 1;
+        month = (d.getDate() < 10 ? '0' : '') + d.getDate()
+        let year = d.getFullYear();
+        let fullDate = year + month + date
+        console.log(fullDate)
+        let exceptionDate = await CalendarDates.find({date: fullDate})
+        */
+        //console.log(exceptionDate)
+        //res.json(fullDate)
+
+        // Get unique headsigns for route
+        let uniqueHeadsigns = await UniqueTrips.aggregate([ 
+            { $match: { route_id: routeId, service_id: "Weekday_merged_999981"} },
+            { $group: { _id: "$trip_headsign" } }  
+        ])
+        
+        // Get stoplist from master stop list based on route_id, service_id, and trip_headsign
+        // First run is usually slower (~1s) than subsequent runs for the same parameters
+        let stopData = await Promise.all(uniqueHeadsigns.map(async x => {
+            let tripHeadsign = x._id
+            let tripInfo = await StopList.find({ route_id: routeId, service_id: "Weekday_merged_999981", trip_headsign: tripHeadsign})
+            // For frontend: return trip_headsign, route_id, and direction_name from first stop before each returned trip so it's easier to access
+            let branchInfo = {route_id: tripInfo[0].route_id, trip_headsign: tripInfo[0].trip_headsign, direction_name: tripInfo[0].direction_name}
+            return {trip: branchInfo, tripInfo}
+        }))
+
+        res.json(stopData)
+
+        const end = Date.now();
+        console.log(`Execution time: ${end - start} ms`) // Return runtime
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error fetching route info' });
     }
 })
 module.exports = router;
+
