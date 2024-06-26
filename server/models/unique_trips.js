@@ -15,4 +15,5 @@ let uniqueTripModel = new mongoose.Schema({
     {
         collection:"uniqueTrips"
     });
+
 module.exports = mongoose.model('uniqueTrips', uniqueTripModel);

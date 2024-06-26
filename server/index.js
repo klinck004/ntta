@@ -3,6 +3,7 @@ const cors = require('cors');
 const express = require('express');
 const mongoose = require('mongoose');
 mongoose.set("strictQuery", false);
+console.log('process.env.NODE_ENV = ' + process.env.NODE_ENV);
 
 let mongoURL = process.env.MONGO_URL
 
@@ -16,9 +17,10 @@ app.use(cors())
 app.use(express.json());
 
 const routes = require('./routes/routes');
+const transit = require('./routes/transit');
 
 app.use('/api', routes)
-
+app.use('/new', transit)
 app.listen(3000, () => {
     console.log(`Server Started at ${3000}`)
 })

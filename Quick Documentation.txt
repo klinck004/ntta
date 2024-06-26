@@ -1,0 +1,173 @@
+GTFS Realtime Functions
+
+gtfsRT()
+- Returns realtime GTFS info in JSON format
+
+gtfsTU()
+- Returns realtime GTFS trip update info in JSON format
+
+
+Data Handling Funnctions
+
+getTrip(tripId)
+	- Query Trips collection based on input tripId and return data in a clean format
+
+getStop(stopId)
+	- Query Stops collection based on input stopId and return data in a clean format
+
+getStopTime(tripId, stopId = undefined)
+	- Get static schedule and stop sequence info based on tripId
+	- Queries StopTimes collection based on input tripId and optional input stopId and returns data in a clean format
+	
+getRouteInfo(routeId)
+	- Query Routes collection based on input routeId and return data in a clean format
+
+getStopsOrder(tripId)
+	- Get static trip info and stops/schedule info based on tripId
+	- Calls getStopTime(tripId) to get stop sequence and schedule info
+	- Modifies data to return stops in sequential order
+
+fullRoute(routeName)
+	- Queries GTFS realtime feed from gtfsRT() to return information on ALL vehicles on currently route
+
+getServiceId() ** UNUSED AND NOT FULLY IMPLEMENTED
+	- Queries Calendar and Calendar_Dates collection and returns service id based on current date 
+	
+getVehicleInfo(entityId) ** UNUSED -- IMPLEMENTED FOR TESTING
+	- Iterates through GTFS realtime feed from gtfsRT() to find specified entityId
+	- ** DOES NOT use Array.map() so slow
+	- Very rudimentary implentation, used in early development and left over for testing
+	
+Production Routes
+
+/routeList
+
+Returns currently active routes based on realtime data 
+
+- *DOES NOT currently show routes that should be active based on time
+	- Example:
+	- If DRT route 916 is currently active and at least one vehicle is in the GTFS realtime feed, it will be returned
+	- If DRT route N1 is currently active and scheduled to run, but no vehicles are in the GTFS realtime feed, it will not be returned
+
+let feed = await gtfsRT();
+	- Call GTFS realtime data using gtfsRT()
+let tripIds = feed.entity.map(entity => entity.vehicle.trip.tripId);
+	- Extract tripId for each entity in GTFS feed: feed and return them to the array tripIds
+let tripInfo = await Trips.find({ trip_id: { $in: tripIds } });
+	- Query Trips collection in database for static trip info and return data if the tripId in list matches a trip_id in Trips
+function filterDuplicates(array)
+	- Take array as input, remove duplicate items based on key(s), and return filtered array
+const currentRoutes = filterDuplicates(tripInfo);
+	- Filter duplicate trip info in array TripInfo and return them to the array currentRoutes
+let routeIds = currentRoutes.map(entity => entity.route_id); 
+	- Extract routeId for each entity in array currentRoutes and return them to the array tripIds
+let routeInfo = await Routes.find({ route_id: { $in: routeIds } });
+	- Query Routes collection in database for static route info and return data if the routeId in list matches a route_id in Routes
+	
+	
+/nextStop?route=routeName&stop=stopId
+
+* Is supposed to return next vehicle information for specified route and stop 
+Returns stop information for specified stop and a list of all vehicles currently on the route
+Does not properly return next vehicles based on direction or static schedule (i.e. vehicles currently on a different route (see block info))
+
+**MODIFIED JSON RESPONSE
+const routeName = req.query.route
+const stopId = req.query.stop
+	- Get query parameters from url (route, stop) and assign them to routeName and stopId respectively
+currentVehicles = await fullRoute(routeName)
+	- Call function fullRoute using routeName as input and assign it to the array currentVehicles
+stopInfo = await getStop(stopId)
+	- Call function getStop using stopId as input to query Stops collection for the specified stop's information
+sendData = { stopInfo: stopInfo, currentVehicles }
+	- Create a JSON object with key stopInfo containing value stopInfo and key currentVehicles containing value currentVehicles
+let tuFeed = await gtfsTU();
+	- Call GTFS trip update data using gtfsTU()
+currentVehicles.entity = currentVehicles.entity.map
+	const test = tuFeed.entity.find(obj => obj.tripUpdate.trip.tripId === entity.vehicle.trip.tripId);
+	- Search trip update feed (tuFeed) for the tripId for the current entity and assign the data to variable test
+	stop = test.tripUpdate.stopTimeUpdate.find(obj => obj.stopId === stopId);
+	- Search for the tripUpdate info in variable test for the specified stop id stopId
+
+JSON response example:
+{
+  "stopInfo": {
+    "_id": "65dc024084b2c72fab90a966",
+    "stop_id": "93112:1",
+    "location_type": 0,
+    "stop_name": "Pickering Parkway Terminal Platform B12",
+    "stop_lat": 43.832968,
+    "wheelchair_boarding": 1,
+    "preferred": 1,
+    "stop_lon": -79.0851,
+    "stop_code": 93112
+  },
+  "currentVehicles": {
+    "entity": [
+      {
+        "id": "6128",
+        "isDeleted": false,
+        "vehicle": {
+          "trip": {
+            "tripId": "3150__62031_Timetable_-_2024-04",
+            "startDate": "20240428",
+            "routeId": "916"
+          },
+          "position": {
+            "latitude": 43.9196815490723,
+            "longitude": -78.8514862060547
+          },
+          "currentStopSequence": 14,
+          "currentStatus": "IN_TRANSIT_TO",
+          "timestamp": "2024-04-28T18:03:59.000Z",
+          "stopId": "591",
+          "vehicle": {
+            "id": "6128"
+          }
+        }
+      },
+	  
+	  
+/showRoute?route=routeId
+
+Returns route info, directions/branches/headsign, and stop list for specified route
+
+const routeName = req.query.route
+	- Get query parameters from url(route) and assign it to routeName 
+let uniqueHeadsigns = await UniqueTrips.aggregate([ 
+	{ $match: { route_id: routeId} },
+	{ $group: { _id: "$trip_headsign" } }  
+])
+	- Query UniqueTrips collection for unique trip headsigns and assign results to uniqueHeadsigns
+uniqueHeadsigns = uniqueHeadsigns.map(x => {
+    return x._id
+})
+uniqueHeadsigns = uniqueHeadsigns.sort()
+	- Extracts trip headsigns from query and sorts them in alphabetical order
+let stopData = await Promise.all(uniqueHeadsigns.map(async x => {
+	let tripHeadsign = x
+	let tripInfo = await StopList.find({ route_id: routeId, service_id: "Saturday_merged_999983", trip_headsign: tripHeadsign})
+	// For frontend: return trip_headsign, route_id, and direction_name from first stop before each returned trip so it's easier to access
+	let branchInfo = {route_id: tripInfo[0].route_id, trip_headsign: tripInfo[0].trip_headsign, direction_name: tripInfo[0].direction_name}
+	return {trip: branchInfo, tripInfo}
+}))
+	- Gets stop data for each trip headsign from uniqueHeadsigns, querying collection StopList based on the route id, service id, and trip headsign
+	- Access route id, trip headsign, and direction name for each direction/branch/headsign
+
+Testing Routes: /test
+
+/test/trip?trip=tripId
+Quickly return trip info in JSON format
+tripId = req.query.trip;
+	- Get query parameters from url(trip) and assign it to tripId
+let tripInfo = await getTrip(tripId)
+	- Call function getTrip with tripId as input to get static trip information from database
+let stops = await getStopsOrder(tripId); // Get static trip information
+	- Call function getStopsOrder with tripId as input to get static stop information in sequential order from database
+
+/test/routeInfo?route=routeId
+Quickly return route info in JSON format
+routeId = req.query.route;
+	- Get query parameters from url(route) and assign it to routeId
+let routeInfo = await getRouteInfo(routeId)
+	- Call function getRouteInfo with routeId as input to get static route information from database

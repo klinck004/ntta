@@ -38,4 +38,7 @@ let stopListModel = new mongoose.Schema({
     {
         collection:"masterstoplist"
     });
+
+stopListModel.index({ route_id: 1, service_id: 1, trip_headsign: 1}, { sparse: true });
+console.log("Master stop list complete")
 module.exports = mongoose.model('masterstoplist', stopListModel);

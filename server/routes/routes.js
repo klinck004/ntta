@@ -1,26 +1,53 @@
 const express = require('express');
 const router = express.Router();
-
+const moment = require('moment');
 
 const GtfsRealtimeBindings = require('gtfs-realtime-bindings');
 const fetch = require('node-fetch');
 const feedUrl = 'https://drtonline.durhamregiontransit.com/gtfsrealtime/VehiclePositions';
 const tuURL = 'https://drtonline.durhamregiontransit.com/gtfsrealtime/TripUpdates';
+const winston = require('winston');
+
+// Create a logger instance
+const logger = winston.createLogger({
+  level: 'info', // Set the logging level
+  format: winston.format.simple(), // Define the log format
+  transports: [
+    new winston.transports.Console() // Add a console transport
+  ]
+});
+
+// Log some messages
+logger.info('This is an informational message');
+logger.warn('This is a warning message');
+logger.error('This is an error message');
+
+
 // Define getTrip to return static GTFS trip data
 // Useful for full return and individual return
+
 
 // Get static trip info by tripId
 let Trips = require('../models/trips');
 let UniqueTrips = require('../models/unique_trips');
+
 async function getTrip(tripId) {
     let value = await Trips.find({ trip_id: tripId });
     value = value[0]
+    console.log(value)
     return value;
+    
 }
 
 let Calendar = require('../models/calendar');
 let CalendarDates = require('../models/calendar_dates');
+
+// Master stop list
+// Will be compiled with an external script and pushed to MongoDB database upon static GTFS feed change
+// Gets unique trips, dropping duplicate "route_id", "direction_name", and "service_id"
+// Gets stop order from stop_times.txt for each unique list and combines it with stop info in stops.txt
 let StopList = require('../models/stop_list');
+
 // Get stop info by stopId
 let Stops = require('../models/stops');
 async function getStop(stopId) {
@@ -49,6 +76,9 @@ async function getRouteInfo(routeId) {
     return value;
 }
 
+// Master static schedule
+let Schedules = require('../models/scheduled');
+
 // Get static trip info and stops/schedule info in one request for route page
 // by tripId
 async function getStopsOrder(tripId) {
@@ -73,6 +103,7 @@ async function getStopsOrder(tripId) {
         return errorOut
     }
 }
+
 
 // Get realtime vehicle information with static trip and static current stop info
 async function getVehicleInfo(entityId) {
@@ -145,7 +176,6 @@ async function fullRoute(routeName) {
     }
 }
 
-
 // GTFS realtime data 
 // *** When making changes for other agencies later consider that some agencies split realtime, trip updates, and alerts into separate feeds
 // cough cough DRT
@@ -193,13 +223,18 @@ async function gtfsTU() {
 }
 
 // API ROUTES
-router.get('/beta/list', async (req, res) => {
+router.get('/routeList', async (req, res) => {
+
     try {
+        const start = Date.now();
         console.log("\nTest - Show routes ");
         let feed = await gtfsRT();
         let tripIds = feed.entity.map(entity => entity.vehicle.trip.tripId);
+        console.log("Trip ids")
+        console.log(tripIds)
         let tripInfo = await Trips.find({ trip_id: { $in: tripIds } });
-
+        console.log("Trip info")
+        console.log(tripInfo)
         function filterDuplicates(array) {
             const seen = new Set();
             return array.filter(obj => {
@@ -213,18 +248,93 @@ router.get('/beta/list', async (req, res) => {
         }
 
         const currentRoutes = filterDuplicates(tripInfo);
+        console.log(currentRoutes)
         let routeIds = currentRoutes.map(entity => entity.route_id);
+        console.log("Route ids", routeIds)
         let routeInfo = await Routes.find({ route_id: { $in: routeIds } });
         console.log(routeInfo)
         res.json(routeInfo)
+        const end = Date.now();
+        console.log(`Execution time: ${end - start} ms`) // Return runtime
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error fetching route info' });
     }
 })
 
-// Beta routes
-router.get('/beta/trip', async (req, res) => {
+// Get next vehicles at stop based on routeId
+router.get('/nextStop', async (req, res) => {
+    try {
+        // Get shape id from unique trips?
+        // Or get shape id from active trips?
+        // Test for speed and efficiency
+
+        console.log("\nNext stop called");
+        const routeName = req.query.route
+        const stopId = req.query.stop
+        console.log("Recd route: " + routeName)
+        console.log("Recd stop: " + stopId)
+
+        // Take routeId and get full route vehicle return
+        currentVehicles = await fullRoute(routeName)
+        console.log("\nCurrent vehicles on route")
+        console.log(currentVehicles)
+        stopInfo = await getStop(stopId)
+        sendData = { stopInfo: stopInfo, currentVehicles }
+        let tuFeed = await gtfsTU();
+
+        // Get schedule from getStopTimes / get GTFSRT tripupdate info when implemented
+        // THIS NEEDS TO BE IN ORDER OF SOONEST
+        currentVehicles.entity = currentVehicles.entity.map(entity => {
+            console.log(entity.vehicle.trip.tripId);
+            const test = tuFeed.entity.find(obj => obj.tripUpdate.trip.tripId === entity.vehicle.trip.tripId); // Find from live tripupdate data
+            console.log(stopId);
+            let stop = null;
+            if (test) {
+                stop = test.tripUpdate.stopTimeUpdate.find(obj => obj.stopId === stopId);
+                console.log(stop);
+            }
+            entity.vehicle.trip.tripUpdate = stop
+            console.log("Trip update info")
+            console.log(entity.vehicle.trip.tripUpdate)
+            return entity;
+        });
+
+        console.log(sendData)
+        res.json(sendData)
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error fetching route info' });
+    }
+})
+
+// Quick function test
+router.get('/showRoute', async (req, res) => {
+    try {
+        const routeName = req.query.route;
+        const start = Date.now(); // Runtime testing
+        let feed = await gtfsRT();
+        const filteredEntities = feed.entity.filter(entity => entity.vehicle.trip.routeId === routeName);
+        for (entity of filteredEntities) {
+            let tripId = entity.vehicle.trip.tripId
+            let value = await Trips.find({ trip_id: tripId });
+            console.log(value[0].trip_headsign);
+        }
+        //const test = filteredEntities.map(entity async => await getStop(entity.vehicle.stopId));
+        //console.log(test);
+        // console.log(filteredEntities);
+        res.json(filteredEntities);
+        const end = Date.now();
+        console.log(`Execution time: ${end - start} ms`) // Return runtime
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error fetching route info' });
+    }
+})
+
+// Testing routes
+// Get trip info
+router.get('/test/trip', async (req, res) => {
     try {
         console.log("\nFull trip info called")
         tripId = req.query.trip;
@@ -242,7 +352,7 @@ router.get('/beta/trip', async (req, res) => {
 })
 
 // Get route info
-router.get('/beta/routeInfo', async (req, res) => {
+router.get('/test/routeInfo', async (req, res) => {
     try {
         console.log("Info called")
         routeId = req.query.route;
@@ -257,95 +367,7 @@ router.get('/beta/routeInfo', async (req, res) => {
     }
 })
 
-// Old showRoute function
-router.get('/beta/showRoute', async (req, res) => {
-    try {
-        const start = Date.now();
-
-        console.log("\Test - Show route info called ");
-        const routeName = req.query.route;
-
-        // Fetch GTFS data
-        const feed = await gtfsRT();
-        const tripIds = feed.entity
-            .filter(entity => entity.vehicle.trip.routeId === routeName)
-            .map(entity => entity.vehicle.trip.tripId);
-
-        console.log(tripIds)
-
-        const tripDetails = await Promise.all(tripIds.map(tripId => getTrip(tripId)));
-        console.log(tripDetails)
-        const uniqueHeadsigns = [...new Set(tripDetails.map(trip => trip.trip_headsign))];
-        console.log(uniqueHeadsigns)
-
-        const final = await Promise.all(uniqueHeadsigns.map(async headsign => {
-            const trip = tripDetails.find(trip => trip.trip_headsign === headsign);
-            const stops = await getStopsOrder(trip.trip_id);
-            return { route: trip.route_id, headsign, stops };
-        }));
-
-        // Send response
-        console.log("***** Routing complete")
-        res.json(final);
-        const end = Date.now();
-        console.log(`Execution time: ${end - start} ms`);
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Error fetching route info' });
-    }
-
-})
-
-// Next stop test
-router.get('/test/next', async (req, res) => {
-    try {
-        // Get shape id from unique trips?
-        // Or get shape id from active trips?
-        // Test for speed and efficiency
-
-        console.log("\nStop test called");
-        const routeName = req.query.route
-        const stopId = req.query.stop
-        console.log("Recd route: " + routeName)
-        console.log("Recd stop: " + stopId)
-
-        // Take routeId and get full route vehicle return
-        currentVehicles = await fullRoute(routeName)
-        console.log("\nCurrent vehicles on route")
-        console.log(currentVehicles)
-        stopInfo = await getStop(stopId)
-        sendData = { stopInfo: stopInfo, currentVehicles }
-        let tuFeed = await gtfsTU();
-
-        // Get schedule from getStopTimes / get GTFSRT tripupdate info when implemented
-
-        currentVehicles.entity = currentVehicles.entity.map(entity => {
-            console.log(entity.vehicle.trip.tripId);
-            const test = tuFeed.entity.find(obj => obj.tripUpdate.trip.tripId === entity.vehicle.trip.tripId); // Find from live tripupdate data
-            console.log(stopId);
-            let stop = null;
-            if (test) {
-                stop = test.tripUpdate.stopTimeUpdate.find(obj => obj.stopId === stopId);
-                console.log(stop);
-            }
-            entity.vehicle.trip.tripUpdate = stop
-            return entity;
-        });
-
-
-
-        console.log(sendData)
-        res.json(sendData)
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Error fetching route info' });
-    }
-
-})
-
-
-
-router.get('/gtfs', async (req, res) => {
+router.get('/test/gtfs', async (req, res) => {
     try {
         console.log("Full GTFS request called")
         let feed = await gtfsRT();
@@ -381,53 +403,70 @@ router.get('/gtfs', async (req, res) => {
     }
 });
 
-// Quick function test
-router.get('/test/function', async (req, res) => {
+async function newGetServiceId() {
+    // Get current date
+    const d = new Date();
+    let day = d.getDay();
+    let date = (d.getDate() < 10 ? '0' : '') + d.getDate()
+    let month = d.getMonth() + 1;
+    month = (month < 10 ? '0' : '') + month
+    let year = d.getFullYear();
+    let fullDate = year + month + date
+
+     
+    let exceptionDate = await CalendarDates.find({date: fullDate})
+    
+    let daysInWeek= ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",]
+    let dayOfWeek = (daysInWeek[day])
+    logger.verbose('test')
+    logger.verbose(`Date: ${fullDate}`)
+    logger.verbose(`Day of week: ${day} ${dayOfWeek}`) 
+    let result = await Calendar.find({[[dayOfWeek]]: 1, start_date: {$lte: fullDate}, end_date: {$gte: fullDate}})
+    return result
+}
+
+router.get('/newRouteList', async (req, res) => {
     try {
+
         const start = Date.now(); // Runtime testing
-        let routeId = req.query.route
+        const serviceId = await newGetServiceId();
+        const serviceList = serviceId.map(doc => doc.service_id);
+        //const serviceList = ['SatSun', 'SatSunReg', 'All Days_merged_999964'];
 
-        // Put this into a function 
-        // Should this be called every time it's needed? 
-        // Y: it's useful to find the service date if it changes while a user is using it
-        // N: service date may change (weekday to weekend) but trips from the previous day may still be running
-        // ^ Is this something that can be accounted for through specific vehicle/stop tracking? 
-        // Is it strictly necessary for showing the routes? Typically, how often do stops change over days? 
-        // Take all this into account
-
-        // Then use to find the trip headsign
-        /*
-        const d = new Date();
-        let day = d.getDay();
-        let date = (d.getDate() < 10 ? '0' : '') + d.getDate()
-        let month = d.getMonth() + 1;
-        month = (d.getDate() < 10 ? '0' : '') + d.getDate()
-        let year = d.getFullYear();
-        let fullDate = year + month + date
-        console.log(fullDate)
-        let exceptionDate = await CalendarDates.find({date: fullDate})
-        */
-        //console.log(exceptionDate)
-        //res.json(fullDate)
-
-        // Get unique headsigns for route
-        let uniqueHeadsigns = await UniqueTrips.aggregate([ 
-            { $match: { route_id: routeId, service_id: "Weekday_merged_999981"} },
-            { $group: { _id: "$trip_headsign" } }  
-        ])
+        const now = moment();
+        const minus2 = now.clone().subtract(2, 'hours').format("HH:mm:ss");
+        const plus2 = now.clone().add(2, 'hours').format("HH:mm:ss");
         
-        // Get stoplist from master stop list based on route_id, service_id, and trip_headsign
-        // First run is usually slower (~1s) than subsequent runs for the same parameters
-        let stopData = await Promise.all(uniqueHeadsigns.map(async x => {
-            let tripHeadsign = x._id
-            let tripInfo = await StopList.find({ route_id: routeId, service_id: "Weekday_merged_999981", trip_headsign: tripHeadsign})
-            // For frontend: return trip_headsign, route_id, and direction_name from first stop before each returned trip so it's easier to access
-            let branchInfo = {route_id: tripInfo[0].route_id, trip_headsign: tripInfo[0].trip_headsign, direction_name: tripInfo[0].direction_name}
-            return {trip: branchInfo, tripInfo}
-        }))
-
-        res.json(stopData)
-
+        let filtered = await Schedules.aggregate([
+            {
+              $match: {
+                service_id: { $in: serviceList },
+                arrival_time: { $gte: minus2, $lte: plus2 }
+              }
+            },
+            {
+              $group: {
+                _id: { route_id: "$route_id"},
+                // Optionally include other fields you want to retain
+                arrival_time: { $first: "$arrival_time" }
+              }
+            },
+            {
+              $project: {
+                _id: 0,
+                route_id: "$_id.route_id",
+              }
+            },
+            {
+                $sort: { route_id: 1 } // Sort by route_id in ascending order
+            }
+          ]);
+        
+        const newFilter = await Promise.all(filtered.map(async (route) => {
+            let routeInfo = await getRouteInfo(route.route_id);
+            return routeInfo;
+        }));
+        res.json(newFilter);
         const end = Date.now();
         console.log(`Execution time: ${end - start} ms`) // Return runtime
     } catch (error) {
@@ -435,5 +474,71 @@ router.get('/test/function', async (req, res) => {
         res.status(500).json({ error: 'Error fetching route info' });
     }
 })
+
+router.get('/newShowRoute', async (req, res) => {
+    try {
+        let routeId = req.query.route
+        console.log(req.query.route)
+        const start = Date.now(); // Runtime testing
+        const serviceId = await newGetServiceId();
+        const serviceList = serviceId.map(doc => doc.service_id);
+        console.log(serviceList)
+        // const serviceList = ['SatSun', 'SatSunReg', 'All Days_merged_999964'];
+        const now = moment();
+        const minus2 = now.clone().subtract(2, 'hours').format("HH:mm:ss");
+        const plus2 = now.clone().add(2, 'hours').format("HH:mm:ss");
+        console.log(now, minus2, plus2)
+        let filtered = await Schedules.aggregate([
+            {
+              $match: {
+                service_id: { $in: serviceList },
+                arrival_time: { $gte: minus2, $lte: plus2 }, 
+                route_id: routeId
+              }
+            },
+            {
+              $group: {
+                _id: "$trip_headsign",
+                trip_id: { $first: "$trip_id" }
+              }
+            },
+            {
+                $sort: { _id: -1 } // Sort by trip_headsign in ascending order
+            },
+            {
+                $project: {
+                    _id: 0,
+                    trip_headsign: "$_id",
+                    trip_id: 1
+                }
+            }
+          ]);
+        if (filtered.length === 0) {
+            
+            console.log("Not yet scheduled")
+            console.log(filtered)   
+            res.json({ error: 'Not yet scheduled' });
+        } else {
+            
+            console.log(filtered[1]._id)
+            console.log(filtered[0]._id)
+           
+            const newFilter = await Promise.all(filtered.map(async (unique) => {
+                console.log(unique.trip_headsign)
+                let stopInfo = await getStopsOrder(unique.trip_id);
+                return {trip_headsign: unique.trip_headsign, stopInfo: stopInfo};
+            }));
+            
+            res.json(newFilter); 
+        }
+       
+        const end = Date.now();
+        console.log(`Execution time: ${end - start} ms`) // Return runtime
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error fetching route info' });
+    }
+})
+
 module.exports = router;
 
